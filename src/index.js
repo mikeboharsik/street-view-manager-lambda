@@ -1,4 +1,4 @@
-const { DynamoDB } = require('@aws-sdk');
+const AWS = require('aws-sdk');
 const fs = require('fs/promises');
 
 const { mapHandler } = require('./handlers');
@@ -11,7 +11,7 @@ async function uploadMetadataToDynamo(event) {
                 requestContext: {
                     http: {
                         method,
-                        path,
+                        path: route,
                         sourceIp,
                     },
                 },
@@ -19,31 +19,33 @@ async function uploadMetadataToDynamo(event) {
 
             const requestSourceIp = Buffer.from(sourceIp).toString('base64');
 
-            const dynamo = new DynamoDB();
-            let { Items: [existingRow] } = await dynamo.query({
+            const dynamo = new AWS.DynamoDB();
+            const queryResult = await dynamo.query({
                 ExpressionAttributeValues: {
                     ':requestSourceIp': {
                         S: requestSourceIp,
                     },
-                    ':requestPath': {
-                        S: path,
+                    ':requestRoute': {
+                        S: route,
                     },
                 },
-                KeyConditionExpress: 'sourceIp = :requestSourceIp AND path = :requestPath',
-                ProjectionExpression: 'count,method,path,sourceIp',
+                KeyConditionExpression: 'sourceIp = :requestSourceIp AND httpRoute = :requestRoute',
+                ProjectionExpression: 'hitCount,httpMethod,httpRoute,sourceIp,updated',
                 TableName: tableName,
             }).promise();
 
+            let { Items: [existingRow] } = queryResult;
+
             if (!existingRow) {
                 existingRow = {
-                    count: {
-                        N: 0,
+                    hitCount: {
+                        N: '0',
                     },
-                    method: {
+                    httpMethod: {
                         S: method,
                     },
-                    path: {
-                        S: path,
+                    httpRoute: {
+                        S: route,
                     },
                     sourceIp: {
                         S: requestSourceIp,
@@ -51,12 +53,15 @@ async function uploadMetadataToDynamo(event) {
                 };
             }
 
-            existingRow.count++;
+            const newHitCount = (parseInt(existingRow.hitCount.N) + 1).toString();
+
+            existingRow.hitCount =  { N: newHitCount };
+            existingRow.updated = { S: new Date().toISOString() };
 
             return await dynamo.putItem({
                 Item: existingRow,
                 TableName: tableName,
-            });
+            }).promise();
         }
 
         console.warn(`Env variable 'DYNAMO_METADATA_TABLE_NAME' not configured, not uploading metadata to DynamoDB`);

@@ -1,9 +1,11 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 Param(
+	[string] $ClientPath = (Resolve-Path "$PSScriptRoot\..\street-view-manager"),
+
 	[switch] $OpenLogs,
 	[switch] $OpenStagingPath,
 
-	[switch] $Dev,
+	[switch] $Prod,
 	[switch] $KeepStagingFiles,
 	[switch] $SkipAppKey,
 	[switch] $SkipUpload,
@@ -11,17 +13,19 @@ Param(
 	[switch] $SkipTests
 )
 
+Write-Verbose "`$ClientPath = $ClientPath"
+
 Write-Verbose "`$OpenLogs = $OpenLogs"
 Write-Verbose "`$OpenStagingPath = $OpenStagingPath"
 
-Write-Verbose "`$Dev = $Dev"
+Write-Verbose "`$Prod = $Prod"
 Write-Verbose "`$KeepStagingFiles = $KeepStagingFiles"
 Write-Verbose "`$SkipUpload = $SkipUpload"
 
-$configFilePath = "$PSScriptRoot\lambda.config.json"
+$configFilePath = "$PSScriptRoot\config.json"
 Write-Verbose "`$configFilePath = '$configFilePath'"
 
-$stagingPath = "$($env:temp)\street-view-manager\staging"
+$stagingPath = "$PSScriptRoot\build\staging"
 Write-Verbose "`$stagingPath = '$stagingPath'"
 
 if ($OpenStagingPath) {
@@ -31,10 +35,10 @@ if ($OpenStagingPath) {
 
 $configs = ConvertFrom-Json -AsHashtable (Get-Content -Raw $configFilePath)
 
-if ($Dev) {
-	$configName = 'dev'
-} else {
+if ($Prod) {
 	$configName = 'prod'
+} else {
+	$configName = 'dev'
 }
 
 $config = $configs[$configName]
@@ -70,54 +74,73 @@ try {
 		Remove-Item -Force -Recurse $stagingPath
 	}
 
-	$uploadPackagePath = Join-Path $stagingPath "..\$lambdaFunctionName.zip"
-	Write-Verbose "`$uploadPackagePath = '$uploadPackagePath'"
-	if (Test-Path $uploadPackagePath) {
-		Remove-Item -Force $uploadPackagePath
-	}
-
 	$env:REACT_APP_CLIENT_ID = $appClientId
 	Write-Verbose "`$env:REACT_APP_CLIENT_ID = '$env:REACT_APP_CLIENT_ID'"
 
 	$env:REACT_APP_KEY = $appKey
 	Write-Verbose "`$env:REACT_APP_KEY = '$env:REACT_APP_KEY'"
 
-	if (!$SkipTests) {
-		yarn test --watchAll=false --verbose
-		if (!$?) {
-			Write-Error "Unit tests failed"
-			return 1
+	Push-Location $ClientPath
+
+	try {
+		if (!$SkipTests) {
+			yarn test --watchAll=false --verbose
+			if (!$?) {
+				Write-Error "Unit tests failed"
+				return 1
+			}
 		}
+	
+		if (!$SkipTests) {
+			yarn cypress run --browser chrome
+			if (!$?) {
+				Write-Error "Integration tests failed"
+				return 1
+			}	
+		}
+
+		if ($TestsOnly) {
+			Pop-Location
+			return
+		}
+	
+		yarn build
+		Write-Verbose "Command 'yarn build' completed"
+		yarn git-hash
+		Write-Verbose "Command 'yarn git-hash' completed"
+	} catch {
+		throw $_
+	} finally {
+		Pop-Location
 	}
 
-	if (!$SkipTests) {
-		yarn cypress run --browser chrome
-		if (!$?) {
-			Write-Error "Integration tests failed"
-			return 1
-		}	
-	}
+	$clientBuildPath = "$ClientPath\build"
+	Write-Verbose "`$clientBuildPath = '$clientBuildPath'"
+	Copy-Item -Recurse $clientBuildPath "$stagingPath\build"
 
-	if ($TestsOnly) {
-		return
-	}
-
-	yarn build
-	Write-Verbose "Command 'yarn build' completed"
-	yarn git-hash
-	Write-Verbose "Command 'yarn git-hash' completed"
-
-	$buildPath = "$PSScriptRoot\build"
-	Write-Verbose "`$buildPath = '$buildPath'"
-	Copy-Item -Recurse $buildPath "$stagingPath\build"
-
-	$lambdaPath = "$PSScriptRoot\lambda"
+	$lambdaPath = "$PSScriptRoot"
 	Write-Verbose "`$lambdaPath = '$lambdaPath'"
-	Copy-Item -Recurse "$lambdaPath\**" $stagingPath
+	Copy-Item -Recurse "$lambdaPath\src\**" $stagingPath
+	Copy-Item -Recurse "$lambdaPath\node_modules" $stagingPath
 
 	Remove-Item "$stagingPath\.gitignore" -ErrorAction SilentlyContinue
 
-	Compress-Archive -Force -Path "$stagingPath\**" -DestinationPath $uploadPackagePath
+	$uploadPackagePath = Join-Path $stagingPath "..\$lambdaFunctionName.zip"
+	Write-Verbose "`$uploadPackagePath = '$uploadPackagePath'"
+	if (Test-Path $uploadPackagePath) {
+		Remove-Item -Force $uploadPackagePath
+	}
+
+	$7zPath = "$env:ProgramFiles\7-Zip\7z.exe"
+	if (Test-Path $7zPath)	{
+		Write-Verbose "Compressing with '$7zPath'"
+
+		& $7zPath a -tzip -mx=9 $uploadPackagePath "$stagingPath\**"
+	} else {
+		Write-Verbose "Compressing with built-in functionality"
+
+		Compress-Archive -Force -Path "$stagingPath\**" -DestinationPath $uploadPackagePath
+	}
 
 	if (!$SkipUpload) {
 		$functionNames = aws lambda list-functions
@@ -134,6 +157,8 @@ try {
 
 		$uploadRes = aws lambda update-function-code --function-name $lambdaFunctionName --zip-file "fileb://$uploadPackagePath"
 		Write-Verbose "AWS lambda code update response:`n$($uploadRes | ConvertFrom-Json | ConvertTo-Json)"
+
+		Write-Host "Lambda function '$lambdaFunctionName' updated"
 	}
 
 	if (!$KeepStagingFiles) {

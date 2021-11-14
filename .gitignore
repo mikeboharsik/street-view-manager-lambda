@@ -1,1 +1,4 @@
+.yarn
+build
 config.json
+node_modules
