@@ -8,6 +8,7 @@ Param(
 	[switch] $Prod,
 	[switch] $KeepStagingFiles,
 	[switch] $SkipAppKey,
+	[switch] $SkipBuild,
 	[switch] $SkipUpload,
 	[switch] $TestsOnly,
 	[switch] $SkipTests
@@ -61,85 +62,88 @@ if (!$lambdaFunctionName) {
 	throw "Configuration is missing required lambda function name"
 }
 
+$uploadPackagePath = Join-Path $stagingPath "..\$lambdaFunctionName.zip"
+Write-Verbose "`$uploadPackagePath = '$uploadPackagePath'"
+
 if ($OpenLogs) {
 	Start-Process "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups/log-group/`$252Faws`$252Flambda`$252F$lambdaFunctionName"
 	return
 }
 
 try {
-	$initAppClientId = $env:REACT_APP_CLIENT_ID
-	$initAppKey = $env:REACT_APP_KEY
+	if (!$SkipBuild) {
+		$initAppClientId = $env:REACT_APP_CLIENT_ID
+		$initAppKey = $env:REACT_APP_KEY
 
-	if (Test-Path $stagingPath) {
-		Remove-Item -Force -Recurse $stagingPath
-	}
+		if (Test-Path $stagingPath) {
+			Remove-Item -Force -Recurse $stagingPath
+		}
 
-	$env:REACT_APP_CLIENT_ID = $appClientId
-	Write-Verbose "`$env:REACT_APP_CLIENT_ID = '$env:REACT_APP_CLIENT_ID'"
+		$env:REACT_APP_CLIENT_ID = $appClientId
+		Write-Verbose "`$env:REACT_APP_CLIENT_ID = '$env:REACT_APP_CLIENT_ID'"
 
-	$env:REACT_APP_KEY = $appKey
-	Write-Verbose "`$env:REACT_APP_KEY = '$env:REACT_APP_KEY'"
+		$env:REACT_APP_KEY = $appKey
+		Write-Verbose "`$env:REACT_APP_KEY = '$env:REACT_APP_KEY'"
 
-	Push-Location $ClientPath
+		Push-Location $ClientPath
 
-	try {
-		if (!$SkipTests) {
-			yarn test --watchAll=false --verbose
-			if (!$?) {
-				Write-Error "Unit tests failed"
-				return 1
+		try {
+			if (!$SkipTests) {
+				yarn test --watchAll=false --verbose
+				if (!$?) {
+					Write-Error "Unit tests failed"
+					return 1
+				}
 			}
-		}
-	
-		if (!$SkipTests) {
-			yarn cypress run --browser chrome
-			if (!$?) {
-				Write-Error "Integration tests failed"
-				return 1
-			}	
-		}
+		
+			if (!$SkipTests) {
+				yarn cypress run --browser chrome
+				if (!$?) {
+					Write-Error "Integration tests failed"
+					return 1
+				}	
+			}
 
-		if ($TestsOnly) {
+			if ($TestsOnly) {
+				Pop-Location
+				return
+			}
+		
+			yarn build
+			Write-Verbose "Command 'yarn build' completed"
+
+			$clientGitHash = git rev-parse head
+			Write-Verbose "Command 'yarn git-hash' completed"
+		} catch {
+			throw $_
+		} finally {
 			Pop-Location
-			return
 		}
-	
-		yarn build
-		Write-Verbose "Command 'yarn build' completed"
-		yarn git-hash
-		Write-Verbose "Command 'yarn git-hash' completed"
-	} catch {
-		throw $_
-	} finally {
-		Pop-Location
-	}
 
-	$clientBuildPath = "$ClientPath\build"
-	Write-Verbose "`$clientBuildPath = '$clientBuildPath'"
-	Copy-Item -Recurse $clientBuildPath "$stagingPath\build"
+		$clientBuildPath = "$ClientPath\build"
+		Write-Verbose "`$clientBuildPath = '$clientBuildPath'"
+		Copy-Item -Recurse $clientBuildPath "$stagingPath\build"
 
-	$lambdaPath = "$PSScriptRoot"
-	Write-Verbose "`$lambdaPath = '$lambdaPath'"
-	Copy-Item -Recurse "$lambdaPath\src\**" $stagingPath
-	Copy-Item -Recurse "$lambdaPath\node_modules" $stagingPath
+		$lambdaPath = "$PSScriptRoot"
+		Write-Verbose "`$lambdaPath = '$lambdaPath'"
+		Copy-Item -Recurse "$lambdaPath\src\**" $stagingPath
+		Copy-Item -Recurse "$lambdaPath\node_modules" $stagingPath
 
-	Remove-Item "$stagingPath\.gitignore" -ErrorAction SilentlyContinue
+		$serverGitHash = git rev-parse head
 
-	$uploadPackagePath = Join-Path $stagingPath "..\$lambdaFunctionName.zip"
-	Write-Verbose "`$uploadPackagePath = '$uploadPackagePath'"
-	if (Test-Path $uploadPackagePath) {
-		Remove-Item -Force $uploadPackagePath
-	}
+		ConvertTo-Json -Depth 10 @{ client = $clientGitHash; server = $serverGitHash }
+			| Set-Content "$stagingPath\build\static\version.json"
 
-	$7zPath = "$env:ProgramFiles\7-Zip\7z.exe"
-	if (Test-Path $7zPath)	{
-		Write-Verbose "Compressing with '$7zPath'"
+		$7zPath = "$env:ProgramFiles\7-Zip\7z.exe"
+		if (Test-Path $7zPath)	{
+			Write-Verbose "Compressing with '$7zPath'"
 
-		& $7zPath a -tzip -mx=9 $uploadPackagePath "$stagingPath\**"
-	} else {
-		Write-Verbose "Compressing with built-in functionality"
+			& $7zPath a -tzip -mx=9 $uploadPackagePath "$stagingPath\**"
+		} else {
+			Write-Verbose "Compressing with built-in functionality"
 
-		Compress-Archive -Force -Path "$stagingPath\**" -DestinationPath $uploadPackagePath
+			Compress-Archive -Force -Path "$stagingPath\**" -DestinationPath $uploadPackagePath
+		}
 	}
 
 	if (!$SkipUpload) {
