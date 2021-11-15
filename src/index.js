@@ -7,7 +7,7 @@ async function uploadMetadataToDynamo(event) {
     try {
         const tableName = process.env.DYNAMO_METADATA_TABLE_NAME;
         if (tableName) {
-            const {
+            let {
                 requestContext: {
                     http: {
                         method,
@@ -18,6 +18,12 @@ async function uploadMetadataToDynamo(event) {
             } = event;
 
             const requestSourceIp = Buffer.from(sourceIp).toString('base64');
+
+            const pattern = /(\/static\/)(js\/|css\/)(.*)(\.js|\.css|\.map)/;
+            const nonStaticFilenameMatch = route.match(pattern);
+            if (nonStaticFilenameMatch) {
+                route = route.replace(pattern, '$1$2source$4');
+            }
 
             const dynamo = new AWS.DynamoDB();
             const queryResult = await dynamo.query({
